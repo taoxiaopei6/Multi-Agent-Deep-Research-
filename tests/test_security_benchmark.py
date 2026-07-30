@@ -26,7 +26,7 @@ def test_all_security_cases():
 
         # Test 1: sanitize_external_text 应该移除或替换注入内容
         sanitized = sanitize_external_text(case.injection_text)
-        sanitized_ok = ("CONTENT REMOVED" in sanitized) or (sanitized != case.injection_text)
+        sanitized_ok = ("CM:" in sanitized) or (sanitized != case.injection_text)
 
         # Test 2: isolate_content 应该包含边界标记
         isolated = isolate_content(case.injection_text, source="web")
@@ -79,7 +79,7 @@ def test_individual_cases():
     cases = all_security_cases()
     for case in cases:
         sanitized = sanitize_external_text(case.injection_text)
-        has_protection = ("CONTENT REMOVED" in sanitized) or (sanitized != case.injection_text)
+        has_protection = ("CM:" in sanitized) or (sanitized != case.injection_text)
         isolated = isolate_content(case.injection_text, source="web")
         has_boundary = "--- EXTERNAL CONTENT" in isolated and "--- END OF EXTERNAL CONTENT" in isolated
         assert has_protection or has_boundary, f"{case.id}: {case.title} — no protection detected"
