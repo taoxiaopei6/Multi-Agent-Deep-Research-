@@ -14,7 +14,7 @@
   <a href="https://www.langchain.com/langgraph"><img src="https://img.shields.io/badge/built%20with-LangGraph-3399FF.svg" alt="LangGraph"></a>
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/API-FastAPI-009688.svg" alt="FastAPI"></a>
   <a href="https://github.com/taoxiaopei6/Multi-Agent-Deep-Research-/actions"><img src="https://img.shields.io/badge/tests-71%20passed-brightgreen" alt="Tests"></a>
-  <a href="https://github.com/taoxiaopei6/Multi-Agent-Deep-Research-/blob/main/app/eval/security_cases.py"><img src="https://img.shields.io/badge/security-20%2F20%20passed-success" alt="Security"></a>
+  <a href="https://github.com/taoxiaopei6/Multi-Agent-Deep-Research-/blob/main/app/eval/security_cases.py"><img src="https://img.shields.io/badge/security-109%2F109%20passed-brightgreen" alt="Security"></a>
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@ Research Question
 | **Research Trace** | Full execution graph with latency, tokens, and decisions | Black box |
 | **Research Artifact** | Structured output: claims + evidence + confidence + audit | Just text |
 | **Evaluation Suite** | 300 benchmark cases + LLM-as-Judge + version comparison | No eval |
-| **Security Benchmark** | 20 prompt injection tests across 4 attack categories | No defense |
+| **Security Benchmark** | 109 prompt injection tests across 12 attack categories | No defense |
 
 ---
 
