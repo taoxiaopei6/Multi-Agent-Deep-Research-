@@ -1,0 +1,34 @@
+# Core
+langgraph>=1.0.0
+langgraph-checkpoint>=3.0.0
+langgraph-checkpoint-postgres>=3.0.0  # optional — for Postgres checkpoint
+langgraph-checkpoint-redis>=0.3.0      # optional — for Redis checkpoint
+
+# LangChain
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-openai>=0.3.0
+langchain-huggingface>=0.1.0          # required for local embedding models
+langchain-text-splitters>=1.0.0
+langchain-milvus>=0.3.0               # optional — for Milvus vector store
+
+# Web API
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+sse-starlette>=1.0.0
+python-multipart>=0.0.5
+
+# Search
+httpx>=0.25.0
+
+# Database (all optional)
+pymilvus>=2.4.0                       # optional — for Milvus
+psycopg[binary,pool]>=3.1.0          # optional — for PostgreSQL
+redis>=5.0.0                          # optional — for Redis
+
+# Config
+python-dotenv>=1.0.0
+pydantic-settings>=2.0.0
+
+# Dev
+typing-extensions>=4.5.0

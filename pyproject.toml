@@ -1,0 +1,38 @@
+[project]
+name = "multi-agent-deep-research"
+version = "0.2.0"
+description = "Multi-Agent Deep Research system powered by LangGraph — 8 agents collaborate on planning, retrieval, evidence evaluation, iteration, and report writing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "taoxiaopei6"}]
+keywords = ["langgraph", "multi-agent", "deep-research", "rag", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "langgraph",
+  "langgraph-checkpoint-redis",
+  "langgraph-checkpoint-postgres",
+  "fastapi",
+  "uvicorn[standard]",
+  "langchain",
+  "langchain-community",
+  "langchain-core",
+  "langchain-milvus",
+  "dashscope",
+  "pymilvus",
+  "psycopg[binary,pool]",
+  "redis",
+  "python-dotenv",
+  "pydantic-settings",
+  "typing-extensions"
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

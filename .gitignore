@@ -1,0 +1,46 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.~
+
+# Node
+node_modules/
+front/agent_front/node_modules/
+front/agent_front/dist/
+
+# Data & outputs
+output/
+app/data/
+data/knowledge/
+
+# Config with secrets
+config.json
+*.local.json
+
+# Logs
+*.log
+
+# Models (download on demand)
+models/

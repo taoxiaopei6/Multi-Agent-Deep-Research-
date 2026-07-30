@@ -1,0 +1,18 @@
+{
+  "api_key": "your-api-key-here",
+  "model": "deepseek-chat",
+  "base_url": "https://api.deepseek.com/v1",
+  "embedding_model_path": "models/bge-m3",
+  "tenant_id": "default_tenant",
+  "user_id": "default_user",
+  "thread_id": "default",
+  "max_iterations": 0,
+  "enable_memory": false,
+  "checkpointer_backend": "memory",
+  "enable_milvus": false,
+  "redis_url": "",
+  "postgres_dsn": "",
+  "milvus_host": "",
+  "milvus_port": 19530,
+  "milvus_collection": "mult_agent_memory"
+}
