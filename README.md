@@ -93,11 +93,19 @@ All conclusions come with **traceable source links** and **confidence scores** t
 
 | Category | Cases | Status |
 |----------|:-----:|:------:|
-| Direct Injection | 5 / 5 | Passed |
-| Role Injection | 5 / 5 | Passed |
-| Evidence Poisoning | 5 / 5 | Passed |
-| Data Exfiltration | 5 / 5 | Passed |
-| **Total** | **20 / 20** | **Passed** |
+| Direct Injection | 10 / 10 | Passed |
+| Role Injection | 10 / 10 | Passed |
+| Evidence Poisoning | 10 / 10 | Passed |
+| Data Exfiltration | 10 / 10 | Passed |
+| Jailbreak | 10 / 10 | Passed |
+| Unicode & Encoding | 9 / 9 | Passed |
+| Context Manipulation | 10 / 10 | Passed |
+| Format Confusion | 10 / 10 | Passed |
+| Refusal Suppression | 10 / 10 | Passed |
+| Authority Manipulation | 10 / 10 | Passed |
+| Multi-turn | 5 / 5 | Passed |
+| Payload Delivery | 5 / 5 | Passed |
+| **Total** | **109 / 109** | **Passed** |
 
 > Evaluation methodology: LLM-as-Judge across 3 dimensions (1-5 scale). Scorer prompts and test cases are publicly defined in `app/eval/`. Security cases in `app/eval/security_cases.py`. Incremental tracking in `output/eval_tracking/`.
 
