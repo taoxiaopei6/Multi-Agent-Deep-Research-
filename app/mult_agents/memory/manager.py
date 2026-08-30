@@ -985,6 +985,35 @@ class MemoryManager:
             )
         return memory_id
 
+    def _build_milvus_filter(
+        self,
+        tenant_id: str,
+        user_id: str,
+        memory_type: Optional[str] = None,
+        namespace: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> str:
+        """构造 Milvus 标量过滤表达式，把作用域过滤前置到 ANN 之前。
+
+        - thread_id 为空则不加该条件（scope=user 时需跨线程召回）
+        - 字段值用双引号包裹并转义，覆盖含 `/` 的 namespace 等特殊字符
+        """
+        def _eq(field: str, value: str) -> str:
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'{field} == "{escaped}"'
+
+        parts = [
+            _eq("tenant_id", tenant_id),
+            _eq("user_id", user_id),
+        ]
+        if memory_type:
+            parts.append(_eq("memory_type", memory_type))
+        if namespace:
+            parts.append(_eq("namespace", namespace))
+        if thread_id:
+            parts.append(_eq("thread_id", thread_id))
+        return " and ".join(parts)
+
     def _search_milvus(
         self,
         tenant_id: str,
@@ -998,16 +1027,18 @@ class MemoryManager:
         if not self._milvus_store:
             return []
         try:
-            # 保留 oversampling：当前仍是在 Python 侧按 tenant/user/type/thread 过滤，
-            # 需要多取一些以保证过滤后仍有足够候选。设置安全上限。
-            # （等以后 metadata filter 下推 Milvus 后再收紧）
-            docs = self._milvus_store.similarity_search(query, k=min(max(limit * 4, 20), 120))
+            # metadata filter 下推：先按作用域过滤再 ANN，无需 Python 侧放大补偿
+            expr = self._build_milvus_filter(
+                tenant_id, user_id, memory_type, namespace, thread_id
+            )
+            docs = self._milvus_store.similarity_search(query, k=max(limit, 20), expr=expr)
             logger.info(
-                "[memory] milvus search raw | tenant=%s user=%s thread=%s query=%s raw_hits=%d",
+                "[memory] milvus search raw | tenant=%s user=%s thread=%s query=%s expr=%s raw_hits=%d",
                 tenant_id,
                 user_id,
                 thread_id or "",
                 query[:120],
+                expr,
                 len(docs),
             )
         except Exception as exc:
