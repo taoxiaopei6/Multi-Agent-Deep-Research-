@@ -472,20 +472,35 @@ class MemoryManager:
                 )
                 conn.commit()
 
+    def _build_search_text(self, summary: str, content) -> str:
+        """生成 search_text：jieba 分词 summary + content，空格连接（与 backfill 完全一致）。"""
+        parts = []
+        if summary:
+            parts.append(summary)
+        try:
+            parts.append(content_to_text(content))
+        except Exception:
+            parts.append(str(content))
+        tokens = tokenize_for_bm25("\n".join(parts))
+        return " ".join(tokens)
+
     def _insert_memory_pg(self, entry: MemoryEntry, summary: str = "") -> None:
         if not self._postgres_dsn or psycopg is None:
             return
+        search_text = self._build_search_text(summary, entry.content)
         with psycopg.connect(self._postgres_dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO memory_entries
-                    (id, tenant_id, user_id, thread_id, memory_type, namespace, content, summary, metadata, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, NOW())
+                    (id, tenant_id, user_id, thread_id, memory_type, namespace, content, summary, metadata, created_at, updated_at, search_text, search_vector)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, NOW(), %s, to_tsvector('simple', %s))
                     ON CONFLICT (id) DO UPDATE SET
                         content = EXCLUDED.content,
                         summary = EXCLUDED.summary,
                         metadata = EXCLUDED.metadata,
+                        search_text = EXCLUDED.search_text,
+                        search_vector = EXCLUDED.search_vector,
                         updated_at = NOW()
                     """,
                     (
@@ -501,6 +516,8 @@ class MemoryManager:
                         summary,
                         json.dumps(entry.metadata),
                         entry.created_at,
+                        search_text,
+                        search_text,
                     ),
                 )
                 conn.commit()
@@ -1129,6 +1146,23 @@ class MemoryManager:
         )
         return entries
 
+    def _build_pg_tsquery(self, query: str) -> str:
+        """用 jieba 预分词构造 recall-oriented OR tsquery（token1 | token2 | ...）。"""
+        tokens = tokenize_for_bm25(query)
+        if not tokens:
+            return ""
+        # 转义 tsquery 特殊字符，'simple' 配置下 token 可直接作为 lexeme
+        cleaned = [t.replace("&", "").replace("|", "").replace("!", "").replace("(", "").replace(")", "") for t in tokens]
+        cleaned = [t for t in cleaned if t]
+        if not cleaned:
+            return ""
+        return " | ".join(cleaned)
+
+    def _safe_tsquery_sql(self, tsquery: str) -> str:
+        """把 tsquery 嵌入 SQL 常量：转义单引号，防止破坏拼接。tsquery 来自内部分词，无外部注入。"""
+        escaped = tsquery.replace("'", "''")
+        return f"to_tsquery('simple', '{escaped}')"
+
     def _search_postgres(
         self,
         tenant_id: str,
@@ -1141,32 +1175,66 @@ class MemoryManager:
     ) -> List[MemoryEntry]:
         if not self._postgres_dsn or psycopg is None:
             return []
-        sql = """
-            SELECT id, memory_type, namespace, content, metadata, created_at
-            FROM memory_entries
-            WHERE tenant_id = %s
-              AND user_id = %s
-              AND memory_type = %s
-        """
+        # 统一拼 WHERE 条件（含作用域过滤），ORDER BY/LIMIT 最后按 query 分支决定。
+        # query 非空走 FTS（search_vector @@ tsquery + ts_rank_cd DESC）；
+        # query 为空保持 created_at DESC（get_task_history 的 recency 路径，绝不进 FTS）。
+        conditions = ["tenant_id = %s", "user_id = %s", "memory_type = %s"]
         params: List[Any] = [tenant_id, user_id, memory_type]
+
+        fts_query = None
         if query:
-            pattern = f"%{query}%"
-            sql += " AND (summary ILIKE %s OR content::text ILIKE %s)"
-            params.extend([pattern, pattern])
+            tsquery = self._build_pg_tsquery(query)
+            if tsquery:
+                fts_query = tsquery
+                conditions.append("search_vector @@ to_tsquery('simple', %s)")
+                params.append(tsquery)
+            else:
+                # query 无法分词（纯符号等），退化为 ILIKE 兼容
+                pattern = f"%{query}%"
+                conditions.append("(summary ILIKE %s OR content::text ILIKE %s)")
+                params.extend([pattern, pattern])
+
         if namespace:
-            sql += " AND namespace = %s"
+            conditions.append("namespace = %s")
             params.append(namespace)
         if thread_id:
-            sql += " AND thread_id = %s"
+            conditions.append("thread_id = %s")
             params.append(thread_id)
-        sql += " ORDER BY created_at DESC LIMIT %s"
-        params.append(limit)
+
+        if fts_query:
+            # FTS 分支：额外 SELECT ts_rank_cd 供 trace/调优（不参与最终 _rerank 权重）。
+            # 注意：ts_rank_cd 的 to_tsquery 用拼接常量（ts_query 来自 _build_pg_tsquery 内部值，
+            # 已清洗特殊字符，无注入风险），避免 SELECT 子句的 %s 打乱参数顺序。
+            tsq_sql = self._safe_tsquery_sql(fts_query)
+            select_cols = f"id, memory_type, namespace, content, metadata, created_at, ts_rank_cd(search_vector, {tsq_sql})"
+            sql = f"""
+                SELECT {select_cols}
+                FROM memory_entries
+                WHERE {' AND '.join(conditions)}
+            """
+            sql += f" ORDER BY ts_rank_cd(search_vector, {tsq_sql}) DESC LIMIT %s"
+            params.append(limit)
+        else:
+            select_cols = "id, memory_type, namespace, content, metadata, created_at"
+            sql = f"""
+                SELECT {select_cols}
+                FROM memory_entries
+                WHERE {' AND '.join(conditions)}
+            """
+            sql += " ORDER BY created_at DESC LIMIT %s"
+            params.append(limit)
+
         with psycopg.connect(self._postgres_dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
         entries: List[MemoryEntry] = []
         for row in rows:
+            metadata = row[4] or {}
+            if fts_query:
+                # row 含 ts_rank_cd（第 7 列）
+                metadata = dict(metadata)
+                metadata["_lexical_recall_score"] = float(row[6]) if row[6] is not None else 0.0
             entries.append(
                 MemoryEntry(
                     id=row[0],
@@ -1174,7 +1242,7 @@ class MemoryManager:
                     memory_type=MemoryType(row[1]),
                     user_id=user_id,
                     namespace=row[2],
-                    metadata=row[4] or {},
+                    metadata=metadata,
                     created_at=row[5],
                 )
             )
