@@ -88,7 +88,6 @@ class MemoryManager:
         self._semantic_store: Optional[SemanticMemoryStore] = None
         self._episodic_store: Optional[EpisodicMemoryStore] = None
         self._rerank_embeddings = None
-        self._active_memory_type: MemoryType = MemoryType.SEMANTIC
         self._redis_client = None
         self._postgres_dsn = postgres_dsn
         self._milvus_store = None
@@ -240,7 +239,7 @@ class MemoryManager:
                         )
                     conn.commit()
         except Exception as exc:
-            logger.warning("PostgreSQL 初始化失败，降级 SQLite: %s", exc)
+            logger.warning("PostgreSQL 初始化失败；配置为 PostgreSQL 的相关记忆功能将不可用: %s", exc)
             self._postgres_dsn = None
 
     def _init_milvus(
@@ -659,6 +658,7 @@ class MemoryManager:
         vec: List[MemoryEntry],
         tenant_id: str,
         user_id: str,
+        memory_type: MemoryType,
     ) -> List[MemoryEntry]:
         """合并 lexical + vector 两路候选，去重并回主存储 hydrate。
 
@@ -666,6 +666,7 @@ class MemoryManager:
         - vec 只贡献 memory_id：同 id 已存在则补 provenance，否则从主存储批量 hydrate
         - 返回的每条 MemoryEntry.content 均为主存储正式记录
         - provenance 记入 metadata["recall_sources"]
+        - memory_type 决定 SQLite hydrate 用 semantic 还是 episodic store（显式传参，避免全局可变状态）
         """
         merged: List[MemoryEntry] = []
         seen: set = set()
@@ -686,7 +687,7 @@ class MemoryManager:
             if primary == "postgres":
                 hyd = self._fetch_postgres_by_ids(tenant_id, user_id, vec_ids)
             else:
-                store = self.semantic if self._active_memory_type == MemoryType.SEMANTIC else self.episodic
+                store = self.semantic if memory_type == MemoryType.SEMANTIC else self.episodic
                 for vid in vec_ids:
                     item = store.get(vid)
                     if item is not None:
@@ -1158,12 +1159,12 @@ class MemoryManager:
         tenant = tenant_id or self.default_tenant_id
         scoped_thread_id = thread_id if self.long_term_scope == "thread" else None
         recall_k = self._recall_k(limit)
-        self._active_memory_type = MemoryType.SEMANTIC
 
-        # 主存储分支：PG（authoritative）或 SQLite，二选一
+        # 主存储分支：PG（authoritative）或 SQLite，二选一。
+        # backend=postgres 时 primary 恒为 postgres；PG 不可用（无 dsn/psycopg/失败）
+        # 由 _search_postgres 内部返回空，绝不进入 SQLite 分支。
         lex: List[MemoryEntry] = []
-        primary = "sqlite"
-        if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
+        if self.long_term_backend == "postgres":
             primary = "postgres"
             lex = self._search_postgres(
                 tenant_id=tenant,
@@ -1175,18 +1176,17 @@ class MemoryManager:
                 limit=recall_k,
             )
         else:
+            primary = "sqlite"
             lex = self.semantic.search(query, user_id=user_id, namespace=namespace, limit=recall_k)
 
         if primary == "postgres" and not lex:
-            # PG 0-hit 就是 0-hit；PG 查询失败时 _search_postgres 内部已返回空。
-            # 不回退 SQLite：当前无 PG↔SQLite 双写，避免读到陈旧/空数据。
+            # PG lexical 0-hit 不代表 vector 没命中，继续 Milvus 召回。
             logger.info(
-                "[memory] semantic search | primary=postgres no hit/failed | tenant=%s user=%s query=%s",
+                "[memory] semantic search | primary=postgres lexical no hit | tenant=%s user=%s query=%s",
                 tenant,
                 user_id,
                 query[:120],
             )
-            return []
 
         # Milvus 向量召回（索引，只贡献 memory_id，最终内容回主存储 hydrate）
         vec: List[MemoryEntry] = []
@@ -1201,7 +1201,7 @@ class MemoryManager:
                 limit=recall_k,
             )
 
-        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id)
+        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id, MemoryType.SEMANTIC)
         if not merged:
             return []
 
@@ -1307,12 +1307,11 @@ class MemoryManager:
         tenant = tenant_id or self.default_tenant_id
         scoped_thread_id = thread_id if self.long_term_scope == "thread" else None
         recall_k = self._recall_k(limit)
-        self._active_memory_type = MemoryType.EPISODIC
 
-        # 主存储分支：PG（authoritative）或 SQLite，二选一
+        # 主存储分支：PG（authoritative）或 SQLite，二选一。
+        # backend=postgres 时 primary 恒为 postgres；PG 不可用由 _search_postgres 内部返回空，绝不进入 SQLite 分支。
         lex: List[MemoryEntry] = []
-        primary = "sqlite"
-        if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
+        if self.long_term_backend == "postgres":
             primary = "postgres"
             lex = self._search_postgres(
                 tenant_id=tenant,
@@ -1324,17 +1323,17 @@ class MemoryManager:
                 limit=recall_k,
             )
         else:
+            primary = "sqlite"
             lex = self.episodic.get_similar_tasks(user_id, query, recall_k)
 
         if primary == "postgres" and not lex:
-            # PG 0-hit 就是 0-hit；不回退 SQLite（无双写同步，防陈旧/空数据）
+            # PG lexical 0-hit 不代表 vector 没命中，继续 Milvus 召回。
             logger.info(
-                "[memory] episodic search | primary=postgres no hit/failed | tenant=%s user=%s query=%s",
+                "[memory] episodic search | primary=postgres lexical no hit | tenant=%s user=%s query=%s",
                 tenant,
                 user_id,
                 query[:120],
             )
-            return []
 
         # Milvus 向量召回（索引，只贡献 memory_id，最终内容回主存储 hydrate）
         vec: List[MemoryEntry] = []
@@ -1349,7 +1348,7 @@ class MemoryManager:
                 limit=recall_k,
             )
 
-        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id)
+        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id, MemoryType.EPISODIC)
         if not merged:
             return []
 
@@ -1441,11 +1440,11 @@ class MemoryManager:
                 tenant_id=tenant,
                 long_term_thread_id=thread_id,
             )
+            # 保持各类型内部 rerank 顺序，不再按 created_at 覆盖相关性排序
             combined = []
             for mem_type, entries in all_memories.items():
                 for entry in entries:
                     combined.append((entry, mem_type))
-            combined.sort(key=lambda x: x[0].created_at, reverse=True)
             context["relevant_memories"] = combined[:max_memories]
         context["recent_tasks"] = self.get_task_history(
             user_id,
