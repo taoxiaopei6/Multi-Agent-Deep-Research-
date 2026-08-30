@@ -6,9 +6,13 @@
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+import jieba
+from rank_bm25 import BM25Okapi
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
@@ -16,7 +20,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from .base import MemoryEntry, MemoryType
-from .long_term import EpisodicMemoryStore, SemanticMemoryStore
+from .long_term import EpisodicMemoryStore, SemanticMemoryStore, content_to_text, tokenize_for_bm25
 from .short_term import ShortTermMemory
 from .utils import extract_memory_from_messages, format_memories_for_prompt, merge_user_profile
 
@@ -43,13 +47,15 @@ logger = logging.getLogger("mult_agents.memory")
 class MemoryManager:
     def __init__(
         self,
-        short_term_ttl: int = 604800,
+        short_term_ttl: int = 604800,  # 7天（以秒为单位）
         short_term_max_messages: int = 30,
         short_term_summary_threshold: int = 20,
         db_path: Optional[str] = None,
+        # 多租户数据隔离：不同租户的记忆相互独立，防止越权。
         tenant_id: str = "default_tenant",
         short_term_backend: str = "postgres",
         long_term_backend: str = "postgres",
+        # 长期记忆隔离粒度："user" 跨会话共享，"thread" 严格会话隔离。
         long_term_scope: str = "user",
         save_conversation_task: bool = False,
         enable_milvus: bool = True,
@@ -76,8 +82,13 @@ class MemoryManager:
         self.short_term_max_messages = short_term_max_messages
         self.short_term_summary_threshold = short_term_summary_threshold
         self.short_term = ShortTermMemory(ttl_seconds=short_term_ttl)
-        self.semantic = SemanticMemoryStore(db_path=db_path, embedding_model_path=embedding_model_path)
-        self.episodic = EpisodicMemoryStore(db_path=db_path, embedding_model_path=embedding_model_path)
+        # 语义/情景 SQLite store 懒加载（见 semantic/episodic property），
+        # 避免与 PostgreSQL 主存储同时初始化、重复加载 embedding 模型。
+        self._sqlite_db_path = db_path
+        self._semantic_store: Optional[SemanticMemoryStore] = None
+        self._episodic_store: Optional[EpisodicMemoryStore] = None
+        self._rerank_embeddings = None
+        self._active_memory_type: MemoryType = MemoryType.SEMANTIC
         self._redis_client = None
         self._postgres_dsn = postgres_dsn
         self._milvus_store = None
@@ -86,9 +97,17 @@ class MemoryManager:
         self._last_milvus_raw_hits: List[Dict[str, Any]] = []
         if self.short_term_backend == "redis":
             self._init_redis(redis_url)
-        self._init_postgres()
-        if self.enable_milvus and self.enable_long_term:
-            self._init_milvus(milvus_host, milvus_port, milvus_collection, embedding_model_path)
+        # PostgreSQL 初始化：short-term 或 long-term 任一方使用 PG 时都需要建表。
+        # _init_postgres 内部按 short_term_backend / long_term_backend 分别决定建哪些表。
+        if self.short_term_backend == "postgres" or self.enable_long_term and self.long_term_backend == "postgres":
+            self._init_postgres()
+        # 按配置初始化后端：只初始化实际使用的长期记忆，避免多个后端同时加载
+        if self.enable_long_term:
+            # 共享嵌入模型：全系统只加载一次，供统一重排(_rerank)、Milvus、SQLite 复用
+            if embedding_model_path:
+                self._load_rerank_embeddings(embedding_model_path)
+            if self.enable_milvus:
+                self._init_milvus(milvus_host, milvus_port, milvus_collection, embedding_model_path)
         self._init_summary_llm(embedding_api_key, base_url, summary_model)
         logger.info(
             "记忆管理器初始化完成 | short_term=%s | long_term=%s | scope=%s | save_task=%s | redis=%s | postgres=%s | milvus=%s",
@@ -100,6 +119,35 @@ class MemoryManager:
             bool(psycopg and self._postgres_dsn),
             bool(self._milvus_store),
         )
+
+    def _load_rerank_embeddings(self, embedding_model_path: str) -> None:
+        """加载共享嵌入模型，供统一重排(_rerank)、Milvus、SQLite 复用。失败时置空，检索降级纯词法。"""
+        try:
+            self._rerank_embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
+            logger.info("重排嵌入模型已加载: %s", embedding_model_path)
+        except Exception as exc:
+            logger.warning("重排嵌入模型加载失败，检索降级纯词法: %s", exc)
+            self._rerank_embeddings = None
+
+    @property
+    def semantic(self) -> SemanticMemoryStore:
+        """语义记忆 SQLite store（懒加载）：仅在实际用到时才构造，避免与 PG 主存储同时初始化。"""
+        if self._semantic_store is None:
+            store = SemanticMemoryStore(db_path=self._sqlite_db_path, embedding_model_path="")
+            if self._rerank_embeddings is not None:
+                store._embeddings = self._rerank_embeddings  # 复用共享模型，不重复加载
+            self._semantic_store = store
+        return self._semantic_store
+
+    @property
+    def episodic(self) -> EpisodicMemoryStore:
+        """情景记忆 SQLite store（懒加载）：同上。"""
+        if self._episodic_store is None:
+            store = EpisodicMemoryStore(db_path=self._sqlite_db_path, embedding_model_path="")
+            if self._rerank_embeddings is not None:
+                store._embeddings = self._rerank_embeddings  # 复用共享模型，不重复加载
+            self._episodic_store = store
+        return self._episodic_store
 
     def _init_redis(self, redis_url: Optional[str]) -> None:
         if not redis_url or redis is None:
@@ -205,7 +253,8 @@ class MemoryManager:
         if not milvus_host or not embedding_model_path:
             return
         try:
-            embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
+            # 复用共享嵌入模型（统一重排已加载），避免重复加载
+            embeddings = self._rerank_embeddings or HuggingFaceEmbeddings(model_name=embedding_model_path)
             self._milvus_store = MilvusVectorStore(
                 embedding_function=embeddings,
                 collection_name=milvus_collection,
@@ -475,6 +524,194 @@ class MemoryManager:
         for entry in entries:
             entry.metadata["retrieval_source"] = source
         return entries
+
+    # ------------------------------------------------------------------
+    # 统一召回 + 重排（recall + rerank）
+    # ------------------------------------------------------------------
+
+    def _rerank_embed(self, text: str) -> List[float]:
+        """为统一重排生成 query / 候选向量。无模型或失败时返回空列表。"""
+        if self._rerank_embeddings is None:
+            return []
+        try:
+            return self._rerank_embeddings.embed_query(text)
+        except Exception as exc:
+            logger.warning("重排向量生成失败，降级纯词法打分: %s", exc)
+            return []
+
+    def _rerank_cosine(self, vec1: List[float], vec2: List[float]) -> float:
+        """计算余弦相似度（与 SQLite 长期记忆打分保持一致）"""
+        if len(vec1) != len(vec2):
+            return 0.0
+
+        dot_product = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = sum(a * a for a in vec1) ** 0.5
+        norm2 = sum(b * b for b in vec2) ** 0.5
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return dot_product / (norm1 * norm2)
+
+    def _recall_k(self, limit: int) -> int:
+        """召回量放大：统一重排需要比最终 limit 更多的候选才有意义。上限 30 约束实时 embedding 成本。"""
+        return min(max(limit * 3, 20), 30)
+
+    def _rerank(
+        self,
+        query: str,
+        candidates: List[MemoryEntry],
+        limit: int,
+    ) -> List[MemoryEntry]:
+        """对候选记忆统一打分排序，与 SQLite 长期记忆的公式一致。
+
+        有 query embedding：0.70*余弦 + 0.25*BM25 + 0.05*exact
+        无 embedding（降级）：0.95*BM25 + 0.05*exact
+        """
+        if not candidates:
+            return []
+
+        query_embedding = self._rerank_embed(query)
+        query_lower = query.strip().lower()
+        query_tokens = tokenize_for_bm25(query)
+
+        # BM25 词法分（先转 float 列表：rank_bm25 返回 numpy 数组）
+        corpus_tokens = [
+            tokenize_for_bm25(content_to_text(e.content))
+            for e in candidates
+        ]
+        bm25_scores = [0.0] * len(candidates)
+        if query_tokens and any(corpus_tokens):
+            bm25 = BM25Okapi(corpus_tokens)
+            raw = [float(s) for s in bm25.get_scores(query_tokens)]
+            max_raw = max(raw) if raw else 0.0
+            if max_raw > 0:
+                bm25_scores = [max(0.0, s) / max_raw for s in raw]
+
+        scored: List[tuple] = []
+        for idx, entry in enumerate(candidates):
+            # 向量分：优先用已存 embedding，否则实时生成（保证 PG/Milvus 候选与 SQLite 同口径）
+            vec_score = 0.0
+            entry_embedding = getattr(entry, "embedding", None)
+            if query_embedding:
+                if not entry_embedding:
+                    entry_embedding = self._rerank_embed(content_to_text(entry.content))
+                if entry_embedding:
+                    vec_score = self._rerank_cosine(entry_embedding, query_embedding)
+                    vec_score = max(0.0, min(1.0, vec_score))
+
+            bm25_score = bm25_scores[idx]
+
+            content_str = content_to_text(entry.content).lower()
+            exact_score = 1.0 if query_lower and query_lower in content_str else 0.0
+
+            if query_embedding:
+                total = vec_score * 0.70 + bm25_score * 0.25 + exact_score * 0.05
+            else:
+                total = bm25_score * 0.95 + exact_score * 0.05
+
+            scored.append((entry, total))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [entry for entry, _ in scored[:limit]]
+
+    def _fetch_postgres_by_ids(
+        self,
+        tenant_id: str,
+        user_id: str,
+        ids: List[str],
+    ) -> Dict[str, MemoryEntry]:
+        """按 memory_id 批量从 PostgreSQL 取回正式记录，避免 N+1 查询。"""
+        if not ids or not self._postgres_dsn or psycopg is None:
+            return {}
+        result: Dict[str, MemoryEntry] = {}
+        try:
+            with psycopg.connect(self._postgres_dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, memory_type, namespace, content, metadata, created_at
+                        FROM memory_entries
+                        WHERE tenant_id = %s AND user_id = %s AND id = ANY(%s)
+                        """,
+                        (tenant_id, user_id, ids),
+                    )
+                    rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("PostgreSQL 批量取回记忆失败: %s", exc)
+            return {}
+        for row in rows:
+            result[row[0]] = MemoryEntry(
+                id=row[0],
+                content=row[3],
+                memory_type=MemoryType(row[1]),
+                user_id=user_id,
+                namespace=row[2],
+                metadata=row[4] or {},
+                created_at=row[5],
+            )
+        return result
+
+    def _merge_and_hydrate(
+        self,
+        primary: str,
+        lex: List[MemoryEntry],
+        vec: List[MemoryEntry],
+        tenant_id: str,
+        user_id: str,
+    ) -> List[MemoryEntry]:
+        """合并 lexical + vector 两路候选，去重并回主存储 hydrate。
+
+        - 去重按 memory_id；主存储条目（lex）优先
+        - vec 只贡献 memory_id：同 id 已存在则补 provenance，否则从主存储批量 hydrate
+        - 返回的每条 MemoryEntry.content 均为主存储正式记录
+        - provenance 记入 metadata["recall_sources"]
+        """
+        merged: List[MemoryEntry] = []
+        seen: set = set()
+        id_to_entry: Dict[str, MemoryEntry] = {}
+
+        for entry in lex:
+            if entry.id in seen:
+                continue
+            seen.add(entry.id)
+            entry.metadata["recall_sources"] = ["lexical"]
+            id_to_entry[entry.id] = entry
+            merged.append(entry)
+
+        # 仅由向量召回、主存储未出现的 id，批量 hydrate
+        vec_ids = [e.id for e in vec if e.id not in seen]
+        hyd = {}
+        if vec_ids:
+            if primary == "postgres":
+                hyd = self._fetch_postgres_by_ids(tenant_id, user_id, vec_ids)
+            else:
+                store = self.semantic if self._active_memory_type == MemoryType.SEMANTIC else self.episodic
+                for vid in vec_ids:
+                    item = store.get(vid)
+                    if item is not None:
+                        hyd[vid] = item
+
+        for e in vec:
+            if e.id in seen:
+                continue
+            hydrated = hyd.get(e.id)
+            if hydrated is None:
+                continue  # 陈旧索引：主存储查不到，丢弃
+            hydrated.metadata["recall_sources"] = ["vector"]
+            seen.add(e.id)
+            merged.append(hydrated)
+
+        # 已被 lexical 召回的同一 id，补充 vector provenance
+        for e in vec:
+            if e.id in seen and e.id in id_to_entry:
+                existing = id_to_entry[e.id]
+                sources = existing.metadata.get("recall_sources") or ["lexical"]
+                if "vector" not in sources:
+                    sources.append("vector")
+                existing.metadata["recall_sources"] = sources
+
+        return merged
 
     def add_short_term_message(
         self,
@@ -760,7 +997,10 @@ class MemoryManager:
         if not self._milvus_store:
             return []
         try:
-            docs = self._milvus_store.similarity_search(query, k=max(limit * 4, 20))
+            # 保留 oversampling：当前仍是在 Python 侧按 tenant/user/type/thread 过滤，
+            # 需要多取一些以保证过滤后仍有足够候选。设置安全上限。
+            # （等以后 metadata filter 下推 Milvus 后再收紧）
+            docs = self._milvus_store.similarity_search(query, k=min(max(limit * 4, 20), 120))
             logger.info(
                 "[memory] milvus search raw | tenant=%s user=%s thread=%s query=%s raw_hits=%d",
                 tenant_id,
@@ -917,61 +1157,66 @@ class MemoryManager:
             return []
         tenant = tenant_id or self.default_tenant_id
         scoped_thread_id = thread_id if self.long_term_scope == "thread" else None
-        if self.enable_milvus:
-            entries = self._search_milvus(
-                tenant_id=tenant,
-                user_id=user_id,
-                query=query,
-                memory_type=MemoryType.SEMANTIC.value,
-                namespace=namespace,
-                thread_id=scoped_thread_id,
-                limit=limit,
-            )
-            if entries:
-                hit_preview = [str(item.content)[:120] for item in entries[:3]]
-                self._annotate_entries_with_source(entries, "milvus")
-                logger.info(
-                    "[memory] semantic search hit | source=milvus | tenant=%s user=%s count=%d query=%s hit_preview=%s",
-                    tenant,
-                    user_id,
-                    len(entries),
-                    query[:120],
-                    json.dumps(hit_preview),
-                )
-                return entries
+        recall_k = self._recall_k(limit)
+        self._active_memory_type = MemoryType.SEMANTIC
+
+        # 主存储分支：PG（authoritative）或 SQLite，二选一
+        lex: List[MemoryEntry] = []
+        primary = "sqlite"
         if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            pg_entries = self._search_postgres(
+            primary = "postgres"
+            lex = self._search_postgres(
                 tenant_id=tenant,
                 user_id=user_id,
                 query=query,
                 memory_type=MemoryType.SEMANTIC.value,
                 namespace=namespace,
                 thread_id=scoped_thread_id,
-                limit=limit,
+                limit=recall_k,
             )
-            if pg_entries:
-                hit_preview = [str(item.content)[:120] for item in pg_entries[:3]]
-                self._annotate_entries_with_source(pg_entries, "postgres")
-                logger.info(
-                    "[memory] semantic search hit | source=postgres | tenant=%s user=%s count=%d query=%s hit_preview=%s",
-                    tenant,
-                    user_id,
-                    len(pg_entries),
-                    query[:120],
-                    json.dumps(hit_preview),
-                )
-                return pg_entries
-        source = "sqlite" if self.long_term_backend != "postgres" else "postgres_no_hit"
+        else:
+            lex = self.semantic.search(query, user_id=user_id, namespace=namespace, limit=recall_k)
+
+        if primary == "postgres" and not lex:
+            # PG 0-hit 就是 0-hit；PG 查询失败时 _search_postgres 内部已返回空。
+            # 不回退 SQLite：当前无 PG↔SQLite 双写，避免读到陈旧/空数据。
+            logger.info(
+                "[memory] semantic search | primary=postgres no hit/failed | tenant=%s user=%s query=%s",
+                tenant,
+                user_id,
+                query[:120],
+            )
+            return []
+
+        # Milvus 向量召回（索引，只贡献 memory_id，最终内容回主存储 hydrate）
+        vec: List[MemoryEntry] = []
+        if self.enable_milvus and self._milvus_store:
+            vec = self._search_milvus(
+                tenant_id=tenant,
+                user_id=user_id,
+                query=query,
+                memory_type=MemoryType.SEMANTIC.value,
+                namespace=namespace,
+                thread_id=scoped_thread_id,
+                limit=recall_k,
+            )
+
+        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id)
+        if not merged:
+            return []
+
+        ranked = self._rerank(query, merged, limit)
+        self._annotate_entries_with_source(ranked, primary)
+        hit_preview = [str(item.content)[:120] for item in ranked[:3]]
         logger.info(
-            "[memory] semantic search fallback | source=%s | tenant=%s user=%s query=%s",
-            source,
-            tenant,
-            user_id,
+            "[memory] semantic search | primary=%s candidates=%d ranked=%d query=%s hit_preview=%s",
+            primary,
+            len(merged),
+            len(ranked),
             query[:120],
+            json.dumps(hit_preview),
         )
-        fallback_entries = self.semantic.search(query, user_id=user_id, namespace=namespace, limit=limit)
-        self._annotate_entries_with_source(fallback_entries, source)
-        return fallback_entries
+        return ranked
 
     def save_task(
         self,
@@ -1061,57 +1306,63 @@ class MemoryManager:
             return []
         tenant = tenant_id or self.default_tenant_id
         scoped_thread_id = thread_id if self.long_term_scope == "thread" else None
-        if self.enable_milvus:
-            entries = self._search_milvus(
-                tenant_id=tenant,
-                user_id=user_id,
-                query=query,
-                memory_type=MemoryType.EPISODIC.value,
-                namespace=None,
-                thread_id=scoped_thread_id,
-                limit=limit,
-            )
-            if entries:
-                self._annotate_entries_with_source(entries, "milvus")
-                logger.info(
-                    "[memory] episodic search hit | source=milvus | tenant=%s user=%s count=%d query=%s",
-                    tenant,
-                    user_id,
-                    len(entries),
-                    query[:120],
-                )
-                return entries
+        recall_k = self._recall_k(limit)
+        self._active_memory_type = MemoryType.EPISODIC
+
+        # 主存储分支：PG（authoritative）或 SQLite，二选一
+        lex: List[MemoryEntry] = []
+        primary = "sqlite"
         if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            pg_entries = self._search_postgres(
+            primary = "postgres"
+            lex = self._search_postgres(
                 tenant_id=tenant,
                 user_id=user_id,
                 query=query,
                 memory_type=MemoryType.EPISODIC.value,
                 namespace=None,
                 thread_id=scoped_thread_id,
-                limit=limit,
+                limit=recall_k,
             )
-            if pg_entries:
-                self._annotate_entries_with_source(pg_entries, "postgres")
-                logger.info(
-                    "[memory] episodic search hit | source=postgres | tenant=%s user=%s count=%d query=%s",
-                    tenant,
-                    user_id,
-                    len(pg_entries),
-                    query[:120],
-                )
-                return pg_entries
-        source = "sqlite" if self.long_term_backend != "postgres" else "postgres_no_hit"
+        else:
+            lex = self.episodic.get_similar_tasks(user_id, query, recall_k)
+
+        if primary == "postgres" and not lex:
+            # PG 0-hit 就是 0-hit；不回退 SQLite（无双写同步，防陈旧/空数据）
+            logger.info(
+                "[memory] episodic search | primary=postgres no hit/failed | tenant=%s user=%s query=%s",
+                tenant,
+                user_id,
+                query[:120],
+            )
+            return []
+
+        # Milvus 向量召回（索引，只贡献 memory_id，最终内容回主存储 hydrate）
+        vec: List[MemoryEntry] = []
+        if self.enable_milvus and self._milvus_store:
+            vec = self._search_milvus(
+                tenant_id=tenant,
+                user_id=user_id,
+                query=query,
+                memory_type=MemoryType.EPISODIC.value,
+                namespace=None,
+                thread_id=scoped_thread_id,
+                limit=recall_k,
+            )
+
+        merged = self._merge_and_hydrate(primary, lex, vec, tenant, user_id)
+        if not merged:
+            return []
+
+        ranked = self._rerank(query, merged, limit)
+        self._annotate_entries_with_source(ranked, primary)
         logger.info(
-            "[memory] episodic search fallback | source=%s | tenant=%s user=%s query=%s",
-            source,
-            tenant,
-            user_id,
+            "[memory] episodic search | primary=%s candidates=%d ranked=%d query=%s",
+            primary,
+            len(merged),
+            len(ranked),
             query[:120],
         )
-        fallback_entries = self.episodic.get_similar_tasks(user_id, query, limit)
-        self._annotate_entries_with_source(fallback_entries, source)
-        return fallback_entries
+        return ranked
 
     def search_all(
         self,
@@ -1227,6 +1478,24 @@ class MemoryManager:
         tenant_id: Optional[str] = None,
         max_memories: int = 8,
     ) -> str:
+        """
+        构建用于注入到大语言模型 (LLM) 的个性化 Prompt 上下文。
+
+        主要功能：
+        1. 上下文聚合：获取用户画像（长期记忆）、最近对话及摘要（短期记忆），并根据当前 query 检索最相关的记忆片段。
+        2. Prompt 格式化：将聚合的上下文信息转换为结构化的 Markdown 文本，供 LLM 理解和使用，使其具备个性化和记忆能力。
+        3. 链路追踪：记录详细的注入日志（如记忆来源分布、Milvus 检索命中详情、注入字符数等）至 `self._last_trace`，便于调试与监控。
+
+        Args:
+            user_id (str): 用户唯一标识。
+            thread_id (str): 当前会话/线程 ID。
+            query (str): 用户的当前查询。
+            tenant_id (Optional[str]): 租户 ID，用于多租户数据隔离，默认使用系统默认租户。
+            max_memories (int): 注入的相关记忆片段的最大数量。
+
+        Returns:
+            str: 格式化后的个性化 Prompt 上下文字符串。
+        """
         self._last_milvus_raw_hits = []
         context = self.get_context_for_agent(
             user_id=user_id,
@@ -1424,9 +1693,9 @@ class MemoryManager:
         if memory_types is None:
             memory_types = ["semantic", "episodic", "short_term"]
         results = {}
-        if "semantic" in memory_types and self.long_term_backend != "postgres":
+        if self.enable_long_term and "semantic" in memory_types and self.long_term_backend != "postgres":
             results["semantic"] = self.semantic.clear(user_id=user_id)
-        if "episodic" in memory_types and self.long_term_backend != "postgres":
+        if self.enable_long_term and "episodic" in memory_types and self.long_term_backend != "postgres":
             results["episodic"] = self.episodic.clear(user_id=user_id)
         if "short_term" in memory_types:
             keys = []
@@ -1470,10 +1739,10 @@ class MemoryManager:
                 "backend": self.short_term_backend,
             },
             "semantic": {
-                "namespaces": [] if self.long_term_backend == "postgres" else self.semantic.list_namespaces(user_id),
+                "namespaces": [] if (not self.enable_long_term or self.long_term_backend == "postgres") else self.semantic.list_namespaces(user_id),
             },
             "episodic": {
-                "namespaces": [] if self.long_term_backend == "postgres" else self.episodic.list_namespaces(user_id),
+                "namespaces": [] if (not self.enable_long_term or self.long_term_backend == "postgres") else self.episodic.list_namespaces(user_id),
             },
             "backends": {
                 "postgres": bool(self._postgres_dsn and psycopg and self.long_term_backend == "postgres"),

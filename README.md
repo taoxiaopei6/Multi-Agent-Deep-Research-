@@ -13,7 +13,7 @@
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python"></a>
   <a href="https://www.langchain.com/langgraph"><img src="https://img.shields.io/badge/built%20with-LangGraph-3399FF.svg" alt="LangGraph"></a>
   <a href="https://fastapi.tiangolo.com"><img src="https://img.shields.io/badge/API-FastAPI-009688.svg" alt="FastAPI"></a>
-  <a href="https://github.com/taoxiaopei6/Multi-Agent-Deep-Research-/actions"><img src="https://img.shields.io/badge/tests-71%20passed-brightgreen" alt="Tests"></a>
+  <img src="https://img.shields.io/badge/tests-71%20passed-brightgreen" alt="Tests">
   <a href="https://github.com/taoxiaopei6/Multi-Agent-Deep-Research-/blob/main/app/eval/security_cases.py"><img src="https://img.shields.io/badge/security-109%2F109%20passed-brightgreen" alt="Security"></a>
 </p>
 
@@ -205,10 +205,10 @@ This is displayed in the Web UI alongside the report, so users can inspect exact
 The system processes external web content, making **Prompt Injection** a primary attack surface. Defense is multi-layered:
 
 1. **Content Boundary Isolation** — External content is wrapped with `--- EXTERNAL CONTENT ---` markers, structurally separated from system instructions
-2. **Injection Pattern Detection** — 14 regex patterns covering 4 attack categories
+2. **Injection Pattern Detection** — Regex patterns covering 12 attack categories
 3. **Content Sanitization** — Known malicious patterns are replaced before reaching the LLM
 
-Security benchmark: **20/20 cases passed** across Direct Injection, Role Injection, Evidence Poisoning, and Data Exfiltration.
+Security benchmark: **109/109 cases passed** across Direct Injection, Role Injection, Evidence Poisoning, Data Exfiltration, Jailbreak, Unicode & Encoding, Context Manipulation, Format Confusion, Refusal Suppression, Authority Manipulation, Multi-turn, and Payload Delivery.
 
 See `security/content_boundary.py` and `tests/test_security_benchmark.py`.
 
@@ -256,7 +256,7 @@ deep_research/
 
 - [x] Research Artifact (claim-evidence-confidence)
 - [x] Structured Trace (latency + tokens)
-- [x] Security Benchmark (20/20)
+- [x] Security Benchmark (109/109)
 - [x] Incremental Evaluation Tracker
 - [ ] Multi-search source support (Google / SerpAPI)
 - [ ] Evidence re-ranking with cross-encoder

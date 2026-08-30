@@ -4,6 +4,8 @@ import sys
 
 def _bootstrap() -> None:
     root = Path(__file__).resolve().parent
+        # 这是 pathlib.Path 重载的 / 运算符，用于拼接路径
+        # 等同于 root.joinpath("app") 或 os.path.join(root, "app")
     src = root / "app"
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))

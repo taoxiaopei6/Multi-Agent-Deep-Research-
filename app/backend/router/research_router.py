@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api/v1/research", tags=["research"])
 
 
 @router.post("/run", response_model=ResearchResponse)
-async def run_research(
+async def run_research(  # 处理非流式深度研究请求：接收查询与配置参数，驱动多智能体工作流执行研究，并返回最终结果。
     payload: ResearchRequest,
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> ResearchResponse:
@@ -33,7 +33,7 @@ async def run_research(
 
 
 @router.post("/stream")
-async def stream_research(
+async def stream_research(  # 处理流式深度研究请求：接收查询与配置参数，驱动多智能体工作流执行研究，并通过 SSE 实时返回事件流。
     payload: ResearchRequest,
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> StreamingResponse:

@@ -21,6 +21,8 @@ class ConversationBuffer:
     对话缓冲区
     
     管理单轮对话的消息历史，支持窗口裁剪和摘要生成
+    实际上是个内存中的对话缓冲区，用于管理单轮对话的消息历史，支持窗口裁剪和摘要生成
+    对话缓冲区对象本质是个列表
     """
     
     def __init__(
@@ -32,7 +34,7 @@ class ConversationBuffer:
         self.max_messages = max_messages
         self.max_tokens = max_tokens
         self.summary_threshold = summary_threshold
-        self.messages: List[BaseMessage] = []
+        self.messages: List[BaseMessage] = []#本质上是一个消息列表
         self.summary: Optional[str] = None
         self.token_count: int = 0
     
@@ -87,24 +89,19 @@ class ConversationBuffer:
     
     def _update_token_count(self) -> None:
         """更新 token 计数（简化估算）"""
-        # 简单估算：每个字符约 0.5 个 token
+        # 中英文混合按平均 2 字符/token 估算
         total_chars = sum(len(str(msg.content)) for msg in self.messages)
         self.token_count = total_chars // 2
     
     def _compress_messages(self) -> None:
-        """
-        压缩消息历史
-        
-        策略：保留最近的消息，将旧消息生成摘要
-        """
+        """压缩消息历史：保留最近的消息，将旧消息截断拼接为摘要。"""
         if len(self.messages) <= self.summary_threshold:
             return
-        
-        # 保留最近的消息
+
+        # 截断最早的消息（超过阈值部分）作为摘要来源
         messages_to_summarize = self.messages[:-self.summary_threshold]
         self.messages = self.messages[-self.summary_threshold:]
-        
-        # 生成摘要（简化版本，实际可以调用 LLM）
+
         summary_parts = []
         for msg in messages_to_summarize:
             role = "用户" if isinstance(msg, HumanMessage) else "AI"
@@ -221,7 +218,7 @@ class ShortTermMemory(BaseMemory):
         metadata: Dict[str, Any]
     ) -> None:
         """更新线程元数据"""
-        buffer = self.get_or_create_buffer(thread_id)
+        buffer = self.get_or_create_buffer(thread_id)#没有则创建
         self._storage[thread_id]["metadata"].update(metadata)
     
     def clear_thread(self, thread_id: str) -> bool:
@@ -267,7 +264,7 @@ class ShortTermMemory(BaseMemory):
     
     def get(self, memory_id: str) -> Optional[MemoryEntry]:
         """获取指定 ID 的记忆（短期记忆不支持按 ID 获取）"""
-        # 短期记忆不支持按 ID 获取，返回 None
+        # 短期记忆不支持按 ID 获取，返回 None，短期记忆的 get() 返回 None，是因为存储时只把消息丢进了列表，没有建立 memory_id → 消息位置 的索引映射。没有存ID标签，自然无法按ID获取
         return None
     
     def search(
@@ -326,7 +323,16 @@ class ShortTermMemory(BaseMemory):
         return self.list_active_threads()
     
     def _cleanup_expired(self) -> None:
-        """清理过期的线程记忆"""
+        """清理过期的线程记忆
+         看一遍所有线程
+
+        如果某个线程很久没用了:
+            删除它
+
+        如果线程总数还是太多:
+            按最后使用时间排序
+            把最老的一批删掉
+        """
         now = datetime.now()
         expired_threads = []
         
@@ -343,7 +349,7 @@ class ShortTermMemory(BaseMemory):
             )
             threads_to_remove = len(self._storage) - self.max_threads
             expired_threads.extend([t[0] for t in sorted_threads[:threads_to_remove]])
-        
+
         for thread_id in set(expired_threads):
             del self._storage[thread_id]
         

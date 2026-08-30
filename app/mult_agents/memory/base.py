@@ -110,7 +110,7 @@ class BaseMemory(ABC):
         pass
     
     @abstractmethod
-    def get(self, memory_id: str) -> Optional[MemoryEntry]:
+    def get(self, memory_id: str) -> Optional[MemoryEntry]:#我手里有一个记忆的ID，怎么把它取回来？，如果存在数据库里就会有这个ID代表这条记忆就是建立索引，有这个索引我能精确找到对应的记忆
         """
         获取指定 ID 的记忆
         

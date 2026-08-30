@@ -46,7 +46,7 @@ class AppConfig:
         return replace(self, **cleaned)
 
     @staticmethod
-    def _default_config_path() -> Path:
+    def _default_config_path() -> Path: #获取当前 Python 文件的绝对路径，然后向上返回第 3 层父目录。
         return Path(__file__).resolve().parents[2] / "config.json"
 
     @staticmethod

@@ -57,15 +57,13 @@ def extract_memory_from_messages(
     extract_preferences: bool = True
 ) -> Dict[str, List[str]]:
     """
-    从消息中提取可记忆的信息
-    
-    简单的规则提取，实际生产环境可以使用 LLM 进行更智能的提取
-    
+    从消息中提取可记忆的信息（基于关键词的规则提取）。
+
     Args:
         messages: 消息列表
         extract_facts: 是否提取事实
         extract_preferences: 是否提取偏好
-        
+
     Returns:
         提取的记忆，按类型分类
     """
@@ -74,16 +72,15 @@ def extract_memory_from_messages(
         "preferences": [],
         "tasks": [],
     }
-    
+
     for msg in messages:
         content = str(msg.content)
         sentences = [item.strip() for item in re.split(r"[。！？!?\n；;]", content) if item.strip()]
         if not sentences:
             sentences = [content.strip()]
-        
+
         # 提取事实（包含"是"、"有"等判断的句子）
         if extract_facts:
-            # 简单的规则：包含特定关键词的句子
             fact_keywords = ["是", "有", "位于", "成立于", "负责", "使用", "叫", "my name is", "i am", "i'm"]
             for keyword in fact_keywords:
                 if keyword in content.lower():

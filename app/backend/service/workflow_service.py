@@ -10,6 +10,18 @@ from mult_agents.state import create_initial_state
 
 
 class WorkflowService:
+    """
+    多智能体深度研究工作流服务类。
+
+    该类负责封装和管理基于 LangGraph 构建的多智能体工作流（Multi-Agent Workflow）的生命周期与执行逻辑。
+    主要职责包括：
+    1. 延迟初始化（Lazy Initialization）：在首次调用时加载配置、构建智能体、内存管理器和 LangGraph 应用。
+    2. 运行时配置管理：支持针对每次请求动态覆盖用户、线程、租户、最大迭代次数及内存开关等参数。
+    3. 同步与异步执行：提供阻塞式执行（`run`, `run_with_route`）以及基于后台线程和异步队列的流式事件推送（`stream_events`）。
+    4. 流式事件与状态追踪：在流式执行过程中，实时解析各节点（如意图识别、规划、检索、分析、反思、写作等）的输出，
+       生成并推送阶段状态（phase）、证据池（evidence）、迭代轮次（iteration）、执行追踪（trace）及研究产物（artifact）等事件。
+    5. 记忆管理：在请求前后与 MemoryManager 交互，构建个性化上下文并持久化当前对话轮次。
+    """
     def __init__(self, config_path: str):
         self._config_path = config_path
         self._lock = Lock()
@@ -19,6 +31,30 @@ class WorkflowService:
         self._app = None
 
     def _ensure_initialized(self) -> None:
+        """
+        确保工作流服务已完成初始化（延迟初始化 / Lazy Initialization）。
+        
+        该方法采用双重检查锁定（Double-Checked Locking）机制，以保证在多线程环境下的线程安全。
+        如果服务尚未初始化，它将依次执行以下操作：
+        1. 从指定路径加载基础配置 (AppConfig)。
+        2. 构建内存管理器 (MemoryManager)。
+        3. 构建多智能体集群 (Agents)。
+        4. 构建状态检查点器 (Checkpointer)。
+        5. 组装并构建最终的 LangGraph 工作流应用 (App)。
+        6. 将初始化标志位设为 True。
+        """
+        if self._initialized:
+            return
+        with self._lock:
+            if self._initialized:
+                return
+            base_config = AppConfig.from_file(self._config_path)
+            self._memory_manager = build_memory_manager(base_config)
+            agents = build_agents(base_config.model, base_config.api_key, base_config.base_url, base_config)
+            checkpointer = build_checkpointer(base_config)
+            self._app = build_workflow_app(agents, checkpointer)
+            self._base_config = base_config
+            self._initialized = True
         if self._initialized:
             return
         with self._lock:
@@ -40,17 +76,44 @@ class WorkflowService:
         max_iterations: int | None,
         enable_memory: bool | None,
     ) -> AppConfig:
+        """
+        构建当前请求的运行时配置。
+        
+        【这是干什么的】：
+        该方法用于将全局的基础配置 (self._base_config) 与当前请求的动态参数
+        (如 user_id, thread_id, max_iterations 等) 进行合并，生成一份专属于
+        本次请求的运行时配置 (AppConfig) 副本。
+        这样可以在不污染全局配置的前提下，实现针对不同用户、会话和请求参数的
+        个性化配置覆盖（例如动态调整最大迭代次数或开关记忆功能）。
+        
+        参数:
+            user_id (str): 用户唯一标识。
+            thread_id (str): 对话/线程唯一标识。
+            tenant_id (str): 租户唯一标识。
+            max_iterations (int | None): 最大迭代次数。若为 None，则使用基础配置中的默认值。
+            enable_memory (bool | None): 是否启用记忆。若为 None，则保留基础配置中的默认设置。
+            
+        返回:
+            AppConfig: 包含运行时覆盖参数的新配置对象。
+            
+        异常:
+            RuntimeError: 当服务尚未初始化（即 _base_config 为 None）时抛出。
+        """
         if self._base_config is None:
-            raise RuntimeError("service not initialized")
+            raise RuntimeError("服务尚未初始化，无法构建运行时配置")
+            
         overrides = {
             "user_id": user_id,
             "thread_id": thread_id,
             "tenant_id": tenant_id,
             "max_iterations": max_iterations if max_iterations is not None else self._base_config.max_iterations,
         }
+        
         if enable_memory is not None:
             overrides["enable_memory"] = enable_memory
+            
         return self._base_config.with_overrides(**overrides)
+
 
     def _run_sync(
         self,
@@ -61,6 +124,33 @@ class WorkflowService:
         max_iterations: int | None,
         enable_memory: bool | None,
     ) -> tuple[str, str]:
+        """
+        同步执行多智能体深度研究工作流。
+
+        【这是干什么的】：
+        该方法以阻塞（同步）方式执行完整的 LangGraph 工作流，通常由外层的异步方法
+        （如 `run` 或 `run_with_route`）通过 `asyncio.to_thread` 放入后台线程中调用。
+        其核心职责包括：
+        1. 确保服务已初始化，并构建当前请求的运行时配置。
+        2. 根据配置决定是否从 MemoryManager 加载个性化记忆上下文。
+        3. 组装初始状态（Initial State），并调用底层 LangGraph 应用的 `invoke` 方法执行推理。
+        4. 从执行结果中提取最终回答（final）和意图路由（route）。
+        5. 若启用了记忆功能，将当前的问答轮次持久化到 MemoryManager 中。
+
+        参数:
+            query (str): 用户的查询问题。
+            user_id (str): 用户唯一标识。
+            thread_id (str): 对话/线程唯一标识。
+            tenant_id (str): 租户唯一标识。
+            max_iterations (int | None): 最大迭代次数。若为 None，则使用基础配置中的默认值。
+            enable_memory (bool | None): 是否启用记忆。若为 None，则保留基础配置中的默认设置。
+
+        返回:
+            tuple[str, str]: 包含两个元素的元组：
+                - final (str): 工作流生成的最终回答或研究报告内容。
+                - route (str): 意图路由结果（如 "direct" 表示直接回答，"multiagent" 表示多智能体研究）。
+        """
+
         self._ensure_initialized()
         runtime_config = self._build_runtime_config(
             user_id=user_id,
@@ -103,6 +193,23 @@ class WorkflowService:
 
     @staticmethod
     def _node_message(node_name: str) -> str:
+        """
+        获取指定工作流节点的执行状态提示信息。
+
+        【这是干什么的】：
+        该方法用于将 LangGraph 工作流中各个节点的内部标识（node_name）
+        转换为对人类友好的、面向前端或日志展示的执行状态描述。
+        在流式执行过程中，当工作流进入某个节点时，系统会调用此方法
+        生成类似 "Planner 正在拆解问题" 的提示语，并通过事件流（如 SSE）推送给前端，
+        以便用户实时了解当前深度研究的进度和具体环节。
+        如果传入的节点名称不在预定义的映射表中，则返回一个默认的通用提示。
+
+        参数:
+            node_name (str): LangGraph 工作流中的节点名称（如 "intent", "plan", "web_search" 等）。
+
+        返回:
+            str: 描述该节点当前正在执行操作的中文提示信息。
+        """
         mapping = {
             "intent": "Intent Router 正在识别问题意图",
             "direct_answer": "Direct Responder 正在快速作答",
@@ -116,9 +223,21 @@ class WorkflowService:
         }
         return mapping.get(node_name, f"{node_name} 正在执行")
 
+
     @staticmethod
     def _extract_trace_metrics(node_output: dict) -> dict | None:
-        """从 node_output 中提取最新的 trace 指标（latency + tokens）。"""
+        """从 node_output 中提取最新的 trace 指标（latency + tokens）。
+        提取节点输出中最新一次 Trace Event 的性能指标。
+
+    该函数从 `node_output["trace_events"]` 中获取最后一个 Trace Event，
+    并提取其中的延迟（latency）和 Token 使用量，统一转换为前端展示
+    所需的格式。
+
+    提取规则：
+        - latency_ms -> duration_ms（保留 1 位小数）
+        - metrics.tokens -> tokens
+        """
+
         try:
             traces = node_output.get("trace_events", [])
             if not traces:
@@ -140,6 +259,56 @@ class WorkflowService:
         """从节点输出构建 Trace 事件。
 
         每个节点完成时，从它的输出中提取关键指标，生成一个结构化的 trace 事件。
+        根据工作流节点输出构建标准化 Trace Event。
+
+        该函数负责将各个 Workflow 节点的执行结果转换为统一格式的
+        Trace Event，供前端执行轨迹（Timeline）、调试日志以及运行
+        状态展示使用。
+
+        每个节点都会生成一个基础事件（节点名称、状态、时间戳），并根据
+        不同节点类型提取具有代表性的业务指标（如搜索结果数量、证据统计、
+        分析结论数量、报告长度等），生成简洁的执行摘要。
+
+        同时会调用 `_extract_trace_metrics()` 提取底层 Trace 指标
+        （例如耗时、Token 消耗），统一附加到事件中。
+
+        支持的节点包括：
+            - intent      ：意图识别结果
+            - plan        ：问题拆解及搜索计划
+            - web_search  ：网络检索统计
+            - local_rag   ：本地知识库检索统计
+            - deep_dive   ：证据池质量统计
+            - analyze     ：分析结论与研究缺口
+            - reflect     ：补充检索计划
+            - write       ：最终报告生成
+
+        Args:
+            node_name:
+                当前执行完成的 Workflow 节点名称。
+
+            node_output:
+                当前节点输出的完整结果字典，用于提取节点摘要信息。
+
+            accumulated:
+                当前 Workflow 已生成的 Trace Event 列表，可用于计算
+                增量统计或历史状态（部分节点可能需要）。
+
+        Returns:
+            dict:
+                标准化 Trace Event，例如：
+
+                {
+                    "node": "web_search",
+                    "status": "completed",
+                    "timestamp": "...",
+                    "metrics": {...},
+                    "summary": "...",
+                    "output_summary": {...}
+                }
+
+            None:
+                当前节点无需生成 Trace Event 时返回 None。
+
         """
         event = {
             "node": node_name,
@@ -244,6 +413,45 @@ class WorkflowService:
         Artifact 将 findings（结论）、claim_map（结论-证据映射）
         和 evidence_pool（证据池）关联成一个结构化产物，
         让用户能追溯"报告中的每个结论来自哪些来源、可信度如何"。
+        根据 Write 节点输出构建结构化 Research Artifact。
+
+        该函数负责将最终研究结果组织为一个可追溯（Traceable）、
+        可解释（Explainable）的结构化产物，用于前端展示报告依据、
+        证据来源以及可信度分析。
+
+        函数会从 Write 节点输出中提取研究结论（findings）、证据池
+        （evidence_pool）、来源索引（source_index）以及审计信息，
+        建立结论与证据之间的映射关系（Claim → Supporting Evidence），
+        同时统计整体证据质量，为最终报告提供透明的来源追踪能力。
+
+        Artifact 的核心内容包括：
+            - 查询内容（Query）
+            - 研究结论（Claims）
+            - 每条结论对应的支持证据（Supporting Evidence）
+            - 证据池统计信息（Evidence Summary）
+            - 审计结果（Audit Flags）
+
+        Args:
+            node_output:
+                Write 节点输出的完整结果字典，应包含 findings、
+                evidence_pool、source_index、audit_flags 等字段。
+
+        Returns:
+            dict:
+                结构化 Research Artifact，例如：
+
+                {
+                    "artifact_version": "1.0",
+                    "query": "...",
+                    "claims": [...],
+                    "evidence_pool_summary": {...},
+                    "audit_flags": 0,
+                    "total_claims": 6,
+                    "total_evidence": 28
+                }
+
+            None:
+                当不存在研究结论且证据池为空时返回 None。
         """
         # node_output 中可能包含完整 state 的部分字段
         # find actual keys — they come from write_node's return dict
@@ -334,6 +542,24 @@ class WorkflowService:
         enable_memory: bool | None,
         emit: Callable[[dict], None],
     ) -> tuple[str, str]:
+        """
+            同步执行一次 Agent 对话任务，并在执行过程中实时产生事件(Event)。
+
+            整个流程包括：
+            1. 初始化运行环境和运行配置(RuntimeConfig)；
+            2. 根据用户信息构建记忆上下文(Memory Context)；
+            3. 创建本轮任务的初始状态(State)；
+            4. 调用 LangGraph 执行整个多Agent工作流；
+            5. 在工作流运行过程中持续监听各节点(Node)输出，并实时发送事件：
+               - 当前执行阶段(phase)
+               - 检索证据(evidence)
+               - 迭代轮次(iteration)
+               - Trace调试信息(trace)
+               - Research Artifact(研究成果)
+            6. 获取最终回答(final)及路由方式(route)；
+            7. 将本轮问答保存到长期记忆(Memory)；
+            8. 返回最终答案和执行路由。
+            """
         self._ensure_initialized()
         runtime_config = self._build_runtime_config(
             user_id=user_id,
@@ -417,6 +643,8 @@ class WorkflowService:
             result = self._app.invoke(state, config)
             final = str(result.get("final", ""))
             route = str(result.get("intent", route)).strip().lower()
+            
+        # 5. 持久化记忆
         if self._memory_manager and runtime_config.enable_memory:
             self._memory_manager.persist_turn(
                 tenant_id=runtime_config.tenant_id,
@@ -475,6 +703,66 @@ class WorkflowService:
         max_iterations: int | None,
         enable_memory: bool | None,
     ) -> AsyncIterator[dict]:
+        """以异步事件流方式执行工作流，并实时输出运行事件。
+
+            该函数负责将同步执行的 Workflow 封装为异步事件流（Async
+            Event Stream），供前端通过 SSE、WebSocket 或其他流式协议
+            实时接收工作流执行过程。
+
+            函数会创建线程安全的事件队列，在后台线程中运行同步 Workflow，
+            并将执行过程中产生的 Trace Event、Research Artifact、状态
+            更新、路由信息以及最终结果持续写入队列，再以异步生成器
+            （AsyncIterator）的形式逐条输出。
+
+            事件流生命周期如下：
+
+                创建事件队列
+                    ↓
+                启动后台 Worker
+                    ↓
+                执行同步 Workflow
+                    ↓
+                emit(...) 持续产生事件
+                    ↓
+                Queue 接收事件
+                    ↓
+                yield 实时返回前端
+                    ↓
+                收到 __done__ 后结束事件流
+
+            Args:
+                query:
+                    用户查询内容。
+
+                user_id:
+                    用户唯一标识。
+
+                thread_id:
+                    当前会话线程 ID。
+
+                tenant_id:
+                    租户标识。
+
+                max_iterations:
+                    最大研究迭代次数。
+
+                enable_memory:
+                    是否启用记忆模块。
+
+            Yields:
+                dict:
+                    Workflow 产生的事件对象，包括但不限于：
+
+                    - trace：节点执行轨迹
+                    - artifact：Research Artifact
+                    - route：工作流路由结果
+                    - final：最终回答
+                    - error：执行异常
+
+            Raises:
+                本函数不会直接抛出工作流异常，异常会被捕获并转换为
+                error 类型事件发送给前端。
+            """
         queue: asyncio.Queue[dict] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 

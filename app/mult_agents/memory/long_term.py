@@ -7,11 +7,15 @@
 
 import json
 import logging
+import re
 import sqlite3
 from abc import ABC
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+import jieba
+from rank_bm25 import BM25Okapi
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -20,9 +24,36 @@ from .base import BaseMemory, MemoryEntry, MemoryType
 logger = logging.getLogger("mult_agents.memory")
 
 
+def content_to_text(content: Any) -> str:
+    """将记忆内容统一转换为可检索文本（供记忆检索/重排复用）"""
+    if isinstance(content, str):
+        return content
+
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def tokenize_for_bm25(text: str) -> List[str]:
+    """中英文混合文本的 BM25 分词（供记忆检索/重排复用）"""
+    if not text:
+        return []
+
+    tokens = jieba.lcut(text.lower(), cut_all=False)
+
+    return [
+        token.strip()
+        for token in tokens
+        if token.strip()
+        and re.search(r"[\w一-鿿]", token)
+    ]
+
+
 class BaseLongTermMemory(BaseMemory, ABC):
     """长期记忆基类"""
-    
+
+
     def __init__(self, memory_type: MemoryType, embedding_model_path: str = ""):
         super().__init__(memory_type)
         self._embedding_dim: Optional[int] = None
@@ -55,6 +86,14 @@ class BaseLongTermMemory(BaseMemory, ABC):
             return 0.0
         
         return dot_product / (norm1 * norm2)
+
+    def _content_to_text(self, content: Any) -> str:
+        """将记忆内容统一转换为可检索文本"""
+        return content_to_text(content)
+
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        """中英文混合文本的 BM25 分词"""
+        return tokenize_for_bm25(text)
 
 
 class SQLiteLongTermMemory(BaseLongTermMemory):
@@ -200,29 +239,75 @@ class SQLiteLongTermMemory(BaseLongTermMemory):
                 params
             ).fetchall()
         
-        # 计算相似度并排序
+        # 将数据库行统一转为 MemoryEntry，便于后续打分
+        entries = [self._row_to_entry(row) for row in rows]
+
+        if not entries:
+            return []
+
+        # --------------------------------------------------
+        # 1. BM25 词法相关性
+        # --------------------------------------------------
+        query_tokens = self._tokenize_for_bm25(query)
+
+        corpus_tokens = [
+            self._tokenize_for_bm25(self._content_to_text(entry.content))
+            for entry in entries
+        ]
+
+        bm25_scores = [0.0] * len(entries)
+
+        if query_tokens and any(corpus_tokens):
+            bm25 = BM25Okapi(corpus_tokens)
+            raw_bm25_scores = bm25.get_scores(query_tokens)
+
+            # BM25 分数归一化到 0~1，便于与向量分数融合
+            # 注意：rank_bm25.get_scores() 返回 numpy 数组，需先转成 float 列表
+            raw_bm25_list = [float(s) for s in raw_bm25_scores]
+
+            max_bm25 = max(raw_bm25_list) if raw_bm25_list else 0.0
+
+            if max_bm25 > 0:
+                bm25_scores = [
+                    max(0.0, score) / max_bm25
+                    for score in raw_bm25_list
+                ]
+
+        # --------------------------------------------------
+        # 2. Embedding + BM25 + Exact Match 综合评分
+        # --------------------------------------------------
         entries_with_scores = []
-        for row in rows:
-            entry = self._row_to_entry(row)
-            
-            # 向量相似度
+
+        query_lower = query.strip().lower()
+
+        for index, entry in enumerate(entries):
+
+            # 向量语义相似度（余弦相似度，夹到 [0,1]）
             vec_score = 0.0
             if entry.embedding and query_embedding:
                 vec_score = self._calculate_similarity(entry.embedding, query_embedding)
-            
-            # 关键词匹配分数
-            text_score = 0.0
-            content_str = str(entry.content).lower()
-            query_lower = query.lower()
-            
-            if query_lower in content_str:
-                text_score = 0.5
-            
-            # 综合分数
-            total_score = vec_score * 0.7 + text_score * 0.3
-            
+                vec_score = max(0.0, min(1.0, vec_score))
+
+            # BM25 词法分数
+            bm25_score = bm25_scores[index]
+
+            # 整句完全命中加分（保留原关键词逻辑，降级为小 bonus）
+            content_str = self._content_to_text(entry.content).lower()
+            exact_score = 1.0 if query_lower and query_lower in content_str else 0.0
+
+            if query_embedding:
+                # 正常情况：语义检索为主，BM25 为辅
+                total_score = (
+                    vec_score * 0.70
+                    + bm25_score * 0.25
+                    + exact_score * 0.05
+                )
+            else:
+                # Embedding 不可用时自动退化为 BM25 关键词检索
+                total_score = bm25_score * 0.95 + exact_score * 0.05
+
             entries_with_scores.append((entry, total_score))
-        
+
         # 按分数排序并返回
         entries_with_scores.sort(key=lambda x: x[1], reverse=True)
         return [entry for entry, _ in entries_with_scores[:limit]]
@@ -415,8 +500,9 @@ class EpisodicMemoryStore(SQLiteLongTermMemory):
     存储历史任务、执行轨迹、交互记录
     使用 namespace 区分不同类型的情景记忆：
     - "tasks/{task_type}": 任务执行记录
-    - "conversations": 对话历史
-    - "actions": 操作记录
+    - "conversations": 对话历史，没有独立方法，合并到 tasks/conversation
+    - "actions": 操作记录                 ❌ 完全没实现
+
     """
     
     def __init__(self, db_path: Optional[str] = None, embedding_model_path: str = ""):
