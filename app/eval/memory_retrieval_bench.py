@@ -164,7 +164,7 @@ def main():
         short_term_backend="memory", long_term_backend="postgres",
         postgres_dsn=PG_DSN, tenant_id=TENANT, enable_milvus=True,
         milvus_host="127.0.0.1", milvus_port=19530, milvus_collection="mult_agent_memory",
-        embedding_model_path="F:/models/bge-m3",
+        embedding_model_path=os.environ.get("EMBEDDING_MODEL_PATH", "models/bge-m3"),
     )
     # 清掉旧 bench 数据（PG + Milvus）
     for uid, tid in [(USER, TENANT), (OTHER_USER, TENANT), (OTHER_USER, OTHER_TENANT)]:
