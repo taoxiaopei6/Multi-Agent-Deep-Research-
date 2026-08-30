@@ -220,8 +220,8 @@ See `security/content_boundary.py` and `tests/test_security_benchmark.py`.
 |-------|-----------|
 | **LLM** | DeepSeek / GPT / Qwen (OpenAI-compatible) |
 | **Workflow** | LangGraph StateGraph + Checkpointer |
-| **Vector Search** | Milvus + BGE-M3 (optional) |
-| **Memory** | Redis + PostgreSQL (optional) |
+| **Vector Search** | Milvus + BGE-M3 (metadata-filtered ANN) |
+| **Memory** | PostgreSQL (FTS lexical) + Milvus (vector) hybrid recall; Redis (optional) |
 | **Web Search** | Bocha API |
 | **Backend** | FastAPI + SSE streaming |
 | **Frontend** | Vue 3 + TypeScript + Vite |
