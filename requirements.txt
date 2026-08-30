@@ -10,7 +10,7 @@ langchain-core>=1.0.0
 langchain-openai>=0.3.0
 langchain-huggingface>=0.1.0          # required for local embedding models
 langchain-text-splitters>=1.0.0
-langchain-milvus>=0.4.0               # optional — for Milvus vector store (>=0.4.0 fixes ConnectionNotExist construct bug)
+langchain-milvus>=0.4.0,<0.5         # optional — for Milvus vector store (>=0.4.0 fixes ConnectionNotExist construct bug; <0.5 avoids next-major break)
 
 # Web API
 fastapi>=0.100.0
@@ -22,7 +22,7 @@ python-multipart>=0.0.5
 httpx>=0.25.0
 
 # Database (all optional)
-pymilvus>=3.0.0                       # optional — for Milvus (3.x required by langchain-milvus>=0.4.0)
+pymilvus>=3.0,<4.0                    # optional — for Milvus (3.x required by langchain-milvus>=0.4.0; <4.0 avoids next-major break)
 psycopg[binary,pool]>=3.1.0          # optional — for PostgreSQL
 redis>=5.0.0                          # optional — for Redis
 

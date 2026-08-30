@@ -108,15 +108,24 @@ class MemoryManager:
             if self.enable_milvus:
                 self._init_milvus(milvus_host, milvus_port, milvus_collection, embedding_model_path)
         self._init_summary_llm(embedding_api_key, base_url, summary_model)
+        # 启动状态：明确记录 primary store / vector index / 可用性 / 检索模式，
+        # 避免"代码支持 Milvus 但配置没开或初始化失败却没发现"
+        pg_available = bool(psycopg and self._postgres_dsn and self.long_term_backend == "postgres")
+        milvus_available = bool(self._milvus_store and self.enable_milvus and self.enable_long_term)
+        primary_store = self.long_term_backend if self.enable_long_term else "disabled"
+        vector_index = "milvus" if milvus_available else ("none" if not self.enable_milvus else "milvus_unavailable")
+        retrieval_mode = "hybrid" if (primary_store != "disabled" and milvus_available) else (
+            "lexical_only" if primary_store != "disabled" else "disabled")
         logger.info(
-            "记忆管理器初始化完成 | short_term=%s | long_term=%s | scope=%s | save_task=%s | redis=%s | postgres=%s | milvus=%s",
+            "记忆管理器初始化完成 | primary_store=%s | vector_index=%s | milvus_available=%s | "
+            "retrieval_mode=%s | short_term=%s | long_term_scope=%s | postgres_available=%s",
+            primary_store,
+            vector_index,
+            milvus_available,
+            retrieval_mode,
             self.short_term_backend,
-            self.long_term_backend,
             self.long_term_scope,
-            self.save_conversation_task,
-            bool(self._redis_client),
-            bool(psycopg and self._postgres_dsn),
-            bool(self._milvus_store),
+            pg_available,
         )
 
     def _load_rerank_embeddings(self, embedding_model_path: str) -> None:

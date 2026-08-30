@@ -2,7 +2,7 @@
   "api_key": "your-api-key-here",
   "model": "deepseek-chat",
   "base_url": "https://api.deepseek.com/v1",
-  "embedding_model_path": "models/bge-m3",
+  "embedding_model_path": "F:/models/bge-m3",
   "tenant_id": "default_tenant",
   "user_id": "default_user",
   "thread_id": "default",
