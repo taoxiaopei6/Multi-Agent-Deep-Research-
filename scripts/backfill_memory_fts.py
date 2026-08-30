@@ -7,7 +7,7 @@ loading the whole table at once.
 
 Usage:
     F:/agent/deep_research_2025/.venv/Scripts/python.exe scripts/backfill_memory_fts.py \
-        --dsn postgresql://root:root123@127.0.0.1:5432/deep_research --batch 500
+        --dsn postgresql://<user>:<pass>@127.0.0.1:5432/deep_research --batch 500
 
 Rerunnable: only updates rows whose search_text is NULL or stale.
 """
@@ -20,7 +20,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import psycopg
 from app.mult_agents.memory.long_term import content_to_text, tokenize_for_bm25
 
-DEFAULT_DSN = "postgresql://root:root123@127.0.0.1:5432/deep_research"
+# 本地开发 DSN：用环境变量覆盖，勿提交真实凭据
+DEFAULT_DSN = os.environ.get(
+    "MEMORY_BACKFILL_PG_DSN",
+    "postgresql://127.0.0.1:5432/deep_research",
+)
 
 
 def build_search_text(summary: str, content) -> str:

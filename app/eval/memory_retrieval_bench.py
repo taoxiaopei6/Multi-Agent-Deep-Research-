@@ -25,7 +25,12 @@ if _PROJECT_ROOT not in sys.path:
 from app.mult_agents.memory.manager import MemoryManager
 from app.mult_agents.memory.base import MemoryType
 
-PG_DSN = "postgresql://root:root123@127.0.0.1:5432/deep_research"
+# 本地开发 DSN：用环境变量覆盖，勿提交真实凭据
+import os
+PG_DSN = os.environ.get(
+    "MEMORY_BENCH_PG_DSN",
+    "postgresql://127.0.0.1:5432/deep_research",
+)
 TENANT = "bench_retrieval"
 USER = "bench_user"
 OTHER_TENANT = "bench_retrieval_other_tenant"
